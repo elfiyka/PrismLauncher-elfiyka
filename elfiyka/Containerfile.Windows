@@ -1,0 +1,252 @@
+# syntax=docker/dockerfile:1
+# Multi-stage container for cross-compiling Prism Launcher to Windows x86_64
+
+# Stage 1: Build environment and third-party dependencies
+FROM docker.io/library/ubuntu:24.04 AS deps
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG QT_VERSION=6.10.2
+ENV QT_VERSION=${QT_VERSION}
+
+# Install build tools, MinGW-w64 compiler, and Python
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build ccache \
+    gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix binutils-mingw-w64-x86-64 \
+    extra-cmake-modules pkg-config python3 python3-pip p7zip-full ca-certificates curl git zip \
+    libglib2.0-0t64 libxkbcommon0 openjdk-17-jdk-headless && \
+    update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix && \
+    update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix && \
+    pip3 install --break-system-packages aqtinstall
+
+# Download host Qt (for moc, rcc, uic) and target Windows Qt6
+RUN --mount=type=cache,target=/root/.cache/aqt \
+    aqt install-qt linux desktop ${QT_VERSION} --outputdir /opt/qt-host && \
+    aqt install-qt windows desktop ${QT_VERSION} win64_mingw --outputdir /opt/qt-target \
+      --modules qtimageformats qtnetworkauth
+
+# Generate CMake cross-compilation toolchain file
+RUN mkdir -p /opt/mingw64 && cat << EOF > /toolchain-mingw64.cmake
+set(CMAKE_SYSTEM_NAME Windows)
+set(CMAKE_SYSTEM_PROCESSOR x86_64)
+set(CMAKE_C_COMPILER x86_64-w64-mingw32-gcc-posix)
+set(CMAKE_CXX_COMPILER x86_64-w64-mingw32-g++-posix)
+set(CMAKE_RC_COMPILER x86_64-w64-mingw32-windres)
+set(QT_HOST_PATH /opt/qt-host/${QT_VERSION}/gcc_64 CACHE PATH "Path to host Qt installation")
+set(CMAKE_PREFIX_PATH /opt/mingw64 /opt/qt-target/${QT_VERSION}/mingw_64)
+set(CMAKE_FIND_ROOT_PATH /opt/mingw64 /opt/qt-target/${QT_VERSION}/mingw_64 /usr/x86_64-w64-mingw32)
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
+set(PKG_CONFIG_EXECUTABLE /usr/bin/pkg-config)
+set(ENV{PKG_CONFIG_LIBDIR} "/opt/mingw64/lib/pkgconfig:/opt/mingw64/share/pkgconfig")
+set(ENV{PKG_CONFIG_SYSROOT_DIR} "/opt/mingw64")
+EOF
+
+# Build Windows dependencies in a consolidated iterative loop (capped at -j 3)
+RUN for dep in \
+      "zlib https://github.com/madler/zlib.git v1.3.1" \
+      "cmark https://github.com/commonmark/cmark.git 0.31.1 -DCMARK_TESTS=OFF -DCMARK_SHARED=ON" \
+      "libqrencode https://github.com/fukuchi/libqrencode.git v4.1.1 -DWITH_TOOLS=OFF -DWITH_TESTS=OFF" \
+      "tomlplusplus https://github.com/marzer/tomlplusplus.git v3.4.0 -DBUILD_TESTING=OFF" \
+      "libarchive https://github.com/libarchive/libarchive.git v3.7.7 -DENABLE_TEST=OFF -DENABLE_TAR=OFF -DENABLE_CPIO=OFF -DENABLE_CAT=OFF -DENABLE_ZLIB=ON -DZLIB_ROOT=/opt/mingw64"; \
+    do \
+      set -- $dep && name=$1 && url=$2 && tag=$3 && shift 3 && \
+      git clone --depth 1 -b "$tag" "$url" "/tmp/$name" && \
+      cmake -B "/tmp/$name/build" -S "/tmp/$name" -G Ninja \
+        -DCMAKE_TOOLCHAIN_FILE=/toolchain-mingw64.cmake \
+        -DCMAKE_INSTALL_PREFIX=/opt/mingw64 \
+        -DCMAKE_BUILD_TYPE=Release "$@" && \
+      cmake --build "/tmp/$name/build" --target install -j 3 && \
+      if [ "$name" = "zlib" ]; then \
+        cp /opt/mingw64/lib/libzlib.dll.a /opt/mingw64/lib/libz.dll.a 2>/dev/null || true; \
+        cp /opt/mingw64/lib/libzlibstatic.a /opt/mingw64/lib/libz.a 2>/dev/null || true; \
+      fi && \
+      rm -rf "/tmp/$name"; \
+    done
+
+# Install automated DLL dependency collector script
+RUN cat << 'EOF' > /usr/local/bin/collect-deps && chmod +x /usr/local/bin/collect-deps
+#!/usr/bin/env python3
+import os, sys, subprocess, shutil
+
+target = sys.argv[1] if len(sys.argv) > 1 else "/package/PrismLauncher"
+qt_dir = os.environ.get("QT_TARGET_DIR", f"/opt/qt-target/{os.environ.get('QT_VERSION', '6.10.2')}/mingw_64")
+deps_dir = os.environ.get("DEPS_DIR", "/opt/mingw64")
+
+for p in ["imageformats", "iconengines", "tls", "networkinformation", "styles"]:
+    src = os.path.join(qt_dir, "plugins", p)
+    if os.path.isdir(src):
+        shutil.copytree(src, os.path.join(target, p), dirs_exist_ok=True)
+os.makedirs(os.path.join(target, "platforms"), exist_ok=True)
+shutil.copy2(os.path.join(qt_dir, "plugins", "platforms", "qwindows.dll"), os.path.join(target, "platforms", "qwindows.dll"))
+ossl = os.path.join(target, "tls", "qopensslbackend.dll")
+if os.path.isfile(ossl):
+    os.remove(ossl)
+
+search_map = {f.lower(): os.path.join(d, f) for d in [os.path.join(qt_dir, "bin"), os.path.join(deps_dir, "bin")] if os.path.isdir(d) for f in os.listdir(d)}
+
+def resolve(dll):
+    try:
+        p = subprocess.check_output(["x86_64-w64-mingw32-gcc", f"-print-file-name={dll}"], text=True).strip()
+        if os.path.isabs(p) and os.path.isfile(p):
+            return p
+    except Exception:
+        pass
+    if dll.lower() in search_map:
+        return search_map[dll.lower()]
+    return None
+
+scanned = set()
+while True:
+    binaries = [os.path.join(r, f) for r, _, fs in os.walk(target) for f in fs if f.lower().endswith((".exe", ".dll")) and os.path.join(r, f) not in scanned]
+    if not binaries:
+        break
+    needed = set()
+    for b in binaries:
+        scanned.add(b)
+        try:
+            out = subprocess.check_output(["x86_64-w64-mingw32-objdump", "-p", b], text=True, stderr=subprocess.DEVNULL)
+            for line in out.splitlines():
+                if "DLL Name:" in line:
+                    needed.add(line.split("DLL Name:")[1].strip())
+        except Exception:
+            pass
+    for s in {resolve(d) for d in needed if d.lower() not in {f.lower() for f in os.listdir(target)}} - {None}:
+        shutil.copy2(s, target)
+
+for r, _, fs in os.walk(target):
+    for f in fs:
+        if f.lower().endswith((".exe", ".dll")):
+            subprocess.run(["x86_64-w64-mingw32-strip", "--strip-unneeded", os.path.join(r, f)], stderr=subprocess.DEVNULL)
+
+package_dlls = {f.lower(): os.path.join(r, f) for r, _, fs in os.walk(target) for f in fs if f.lower().endswith(".dll")}
+
+def get_real_imports(filepath):
+    out = subprocess.check_output(["x86_64-w64-mingw32-objdump", "-p", filepath], text=True)
+    imports = {}
+    cur_dll = None
+    in_table = False
+    for line in out.splitlines():
+        if "DLL Name:" in line:
+            cur_dll = line.split("DLL Name:")[1].strip().lower()
+            imports[cur_dll] = set()
+            in_table = False
+        elif cur_dll and "vma:  Hint/Ord" in line:
+            in_table = True
+        elif in_table:
+            if not line.strip() or line.startswith(" " * 10) or "DLL Name" in line:
+                in_table = False
+                continue
+            parts = line.strip().split()
+            if len(parts) >= 3:
+                sym = parts[-1]
+                if not sym.startswith(("[", "<")) and not sym.endswith("]"):
+                    imports[cur_dll].add(sym)
+    return imports
+
+def get_pe_exports(filepath):
+    out = subprocess.check_output(["x86_64-w64-mingw32-objdump", "-p", filepath], text=True)
+    exports = set()
+    in_exp = False
+    for line in out.splitlines():
+        if "[Ordinal/Name Pointer] Table" in line:
+            in_exp = True
+            continue
+        if in_exp:
+            if not line.strip():
+                in_exp = False
+                continue
+            parts = line.strip().split()
+            if len(parts) >= 2 and parts[0].startswith("["):
+                exports.add(parts[-1])
+    return exports
+
+exports_cache = {dll_name: get_pe_exports(path) for dll_name, path in package_dlls.items()}
+
+missing_symbols = []
+for r, _, fs in os.walk(target):
+    for f in fs:
+        if f.lower().endswith((".exe", ".dll")):
+            bin_path = os.path.join(r, f)
+            imps = get_real_imports(bin_path)
+            for dll, syms in imps.items():
+                if dll in exports_cache:
+                    missing = syms - exports_cache[dll]
+                    if missing:
+                        missing_symbols.append(f"{f} -> {dll}: {missing}")
+
+if missing_symbols:
+    print("FATAL: Missing symbols detected in packaged binaries:")
+    for err in missing_symbols:
+        print(f"  {err}")
+    sys.exit(1)
+print("SUCCESS: All imported symbols in packaged binaries are satisfied.")
+EOF
+
+# Stage 2: Application compilation
+FROM deps AS builder
+
+ARG BUILD_TYPE=Release
+WORKDIR /src
+COPY . /src
+
+# Build Prism Launcher and elfiyka target with ccache (capped at -j 3)
+RUN --mount=type=cache,target=/root/.cache/ccache,id=prismlauncher-ccache \
+    export CCACHE_DIR=/root/.cache/ccache && \
+    export CCACHE_BASEDIR=/src && \
+    export CCACHE_COMPRESS=true && \
+    export CCACHE_COMPRESSLEVEL=1 && \
+    export CCACHE_MAXSIZE=5G && \
+    export CCACHE_SLOPPINESS=time_macros,include_file_mtime,include_file_ctime && \
+    cmake -B build -G Ninja \
+      -DCMAKE_TOOLCHAIN_FILE=/toolchain-mingw64.cmake \
+      -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
+      -DLauncher_BUILD_PLATFORM="windows-x86_64" \
+      -DLauncher_USE_PCH=OFF \
+      -DENABLE_LTO=OFF \
+      -DLauncher_BUILD_UPDATER=OFF \
+      -DLauncher_ENABLE_UPDATER=OFF \
+      -DLauncher_MSA_CLIENT_ID="" \
+      -DBUILD_TESTING=ON && \
+    cmake --build build -j 3 && \
+    ccache -s
+
+# Stage 3: Test runner
+FROM builder AS tester
+
+RUN /opt/qt-host/${QT_VERSION}/gcc_64/libexec/moc /src/elfiyka/AuthServer.h -o /tmp/moc_AuthServer.cpp && \
+    /opt/qt-host/${QT_VERSION}/gcc_64/libexec/moc /src/elfiyka/AuthServer_test.cpp -o /tmp/AuthServer_test.moc && \
+    g++ -std=c++17 -fPIC -I/src/elfiyka -I/tmp \
+      -I/opt/qt-host/${QT_VERSION}/gcc_64/include \
+      -I/opt/qt-host/${QT_VERSION}/gcc_64/include/QtCore \
+      -I/opt/qt-host/${QT_VERSION}/gcc_64/include/QtNetwork \
+      -I/opt/qt-host/${QT_VERSION}/gcc_64/include/QtTest \
+      /src/elfiyka/AuthServer.cpp /tmp/moc_AuthServer.cpp /src/elfiyka/AuthServer_test.cpp \
+      -L/opt/qt-host/${QT_VERSION}/gcc_64/lib -lQt6Test -lQt6Network -lQt6Core \
+      -Wl,-rpath,/opt/qt-host/${QT_VERSION}/gcc_64/lib \
+      -o /usr/local/bin/authserver_test_native && \
+    /usr/local/bin/authserver_test_native && \
+    rm -f /tmp/moc_AuthServer.cpp /tmp/AuthServer_test.moc
+
+ENTRYPOINT ["/usr/local/bin/authserver_test_native"]
+
+# Stage 4: Package creation
+FROM tester AS packager
+
+RUN mkdir -p /package/PrismLauncher /dist && \
+    cmake --install build --component Runtime --prefix /package/PrismLauncher && \
+    cmake --install build --component portable --prefix /package/PrismLauncher && \
+    cp -r /src/build/jars /package/PrismLauncher/ 2>/dev/null || true && \
+    collect-deps /package/PrismLauncher && \
+    cd /package && zip -r -9 /dist/PrismLauncher-Windows-x86_64-Portable.zip PrismLauncher
+
+# Stage 5: Direct file export
+FROM scratch
+
+COPY --from=packager /dist/PrismLauncher-Windows-x86_64-Portable.zip /

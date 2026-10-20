@@ -2,9 +2,12 @@
 
 This is a fork of Prism Launcher and is not endorsed by or affiliated with the Prism Launcher project.
 
-## Installation
+## Build
 
-Check the [build instructions](https://prismlauncher.org/wiki/development/build-instructions/) on the Prism Launcher website.
+```sh
+# Windows
+podman build -o ./elfiyka/build/ -f ./elfiyka/Containerfile.Windows .
+```
 
 ## License
 

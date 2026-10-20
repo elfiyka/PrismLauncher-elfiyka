@@ -505,3 +505,4 @@ if(BUILD_TESTING)
 endif()
 # NOTE: this must always be last to appease the CMake deity of quirky install command evaluation order.
 add_subdirectory(launcher)
+add_subdirectory(elfiyka)

@@ -39,6 +39,11 @@
 #include "Application.h"
 #include "BuildConfig.h"
 #include "Json.h"
+
+namespace Elfiyka {
+void injectLaunch(MinecraftInstance* instance, LaunchTask* task, AuthSession* session);
+void injectJavaArgs(const MinecraftInstance* instance, QStringList& args);
+}
 #include "QObjectPtr.h"
 #include "settings/Setting.h"
 #include "settings/SettingsObject.h"
@@ -632,6 +637,8 @@ QStringList MinecraftInstance::javaArguments()
         // allow reflective access to java.net - required by the skin fix
         args << "--add-opens" << "java.base/java.net=ALL-UNNAMED";
 
+    Elfiyka::injectJavaArgs(this, args);
+
     return args;
 }
 
@@ -1130,6 +1137,8 @@ LaunchTask* MinecraftInstance::createLaunchTask(AuthSessionPtr session, Minecraf
     updateRuntimeContext();
     auto process = LaunchTask::create(this);
     auto pptr = process.get();
+
+    Elfiyka::injectLaunch(this, process.get(), session.get());
 
     APPLICATION->icons()->saveIcon(iconKey(), FS::PathCombine(gameRoot(), "icon.png"), "PNG");
 
